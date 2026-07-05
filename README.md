@@ -4,7 +4,8 @@ Standalone publication-ready export of the saliency-map experiment from the orig
 
 ## Included Code
 
-- `statistical_radiomics_saliency_maps.py` as the experiment entrypoint
+- `statistical_radiomics_saliency_maps.py` as the experiment entrypoint (CLI argument parsing)
+- `radiomics_saliency/` contains the experiment pipeline (feature extraction, models, training, saliency-map generation, visualization)
 - `data/` contains dataset loaders
 - `nn/pytorch/radiomics/` for statistical radiomics feature layers and classifiers
 - `radiomics_rs/` for the Rust-backed texture-matrix and saliency-map extension

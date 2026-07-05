@@ -8,7 +8,7 @@ from skimage.transform import resize
 from skimage.color import rgb2gray
 from sklearn.model_selection import train_test_split
 
-from medmnist import PneumoniaMNIST, DermaMNIST, BloodMNIST
+from medmnist import PneumoniaMNIST, DermaMNIST, BloodMNIST, OrganSMNIST
 
 import torchvision.datasets as datasets
 
@@ -62,6 +62,9 @@ def load_dataset_with_heldout_test(dataset_name: str, data_path: str):
         return images, labels, test_images, test_labels, np.arange(test_images.shape[0])
     elif dataset_name == 'medmnist_derma':
         images, labels, test_images, test_labels = load_medmnist_derma()
+        return images, labels, test_images, test_labels, np.arange(test_images.shape[0])
+    elif dataset_name in ('raw_blood_cells', 'medmnist_blood'):
+        images, labels, test_images, test_labels = load_medmnist_blood()
         return images, labels, test_images, test_labels, np.arange(test_images.shape[0])
     elif dataset_name == 'brain_mri':
         images, labels, test_images, test_labels = load_brain_mri_data(data_path)
@@ -122,6 +125,22 @@ def load_medmnist_pneumonia():
     return images, labels, test_images, test_labels
 
 def load_medmnist_derma():
+    train_dataset = OrganSMNIST(split="train", size=64, download=True)
+    val_dataset = OrganSMNIST(split="val", size=64, download=True)
+    test_dataset = OrganSMNIST(split="test", size=64, download=True)
+    images = np.concatenate([train_dataset.imgs, val_dataset.imgs], axis=0)
+    labels = np.concatenate([train_dataset.labels, val_dataset.labels], axis=0)
+    images_result = np.zeros(shape=images.shape)
+    test_images_result = np.zeros(shape=test_dataset.imgs.shape)
+    print(images.shape)
+    for i in range(len(images)):
+        images_result[i] = img_as_ubyte(images[i])
+    for i in range(len(test_dataset.imgs)):
+        test_images_result[i] = img_as_ubyte(test_dataset.imgs[i])
+    return images_result, labels, test_images_result, test_dataset.labels
+
+
+def load_medmnist_blood():
     train_dataset = BloodMNIST(split="train", size=64, download=True)
     val_dataset = BloodMNIST(split="val", size=64, download=True)
     test_dataset = BloodMNIST(split="test", size=64, download=True)
@@ -129,7 +148,6 @@ def load_medmnist_derma():
     labels = np.concatenate([train_dataset.labels, val_dataset.labels], axis=0)
     images_result = np.zeros(shape=images.shape[:-1])
     test_images_result = np.zeros(shape=test_dataset.imgs.shape[:-1])
-    print(images.shape)
     for i in range(len(images)):
         images_result[i] = img_as_ubyte(rgb2gray(images[i]))
     for i in range(len(test_dataset.imgs)):
