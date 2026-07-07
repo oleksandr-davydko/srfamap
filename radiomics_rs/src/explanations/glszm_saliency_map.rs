@@ -4,6 +4,12 @@ use crate::texture_matrices::glszm_routines::calculate_zone_stats;
 pub fn glszm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, omit_zeros: bool, mask: Option<ArrayViewD<u8>>) -> Array2<f32> {
     let width = image.shape()[1];
     let height = image.shape()[0];
+    // Zone sizes larger than the attribution matrix has columns for were excluded when
+    // the GLSZM matrix was built (glszm_routines drops freq > max_size - 1), so they
+    // carry no attribution. Bound against the actual attribution width instead of a
+    // hard-coded size to keep the two consistent and avoid an out-of-bounds panic on
+    // images with large uniform zones (e.g. BloodMNIST).
+    let max_frequency = attributions.shape()[1];
     let mut map = Array2::zeros((height, width));
     let (zone_map, _, unique_frequency) = calculate_zone_stats(&image, omit_zeros);
     let mut invalid_zone_ids = std::collections::HashSet::new();
@@ -33,7 +39,7 @@ pub fn glszm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, 
                 continue;
             }
             let frequency = unique_frequency.get(&zone_id).unwrap().to_owned();
-            if frequency > 223 {
+            if frequency as usize >= max_frequency {
                 continue;
             }
             let attribution = attributions[[intensity as usize, frequency as usize]];

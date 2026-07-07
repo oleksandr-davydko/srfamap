@@ -26,7 +26,8 @@ from radiomics_saliency.models import MultiClassIGTarget, RadiomicMatricesVector
 
 class SaliencyMapGenerator:
     def __init__(self, model: torch.nn.Module, explanation_wrapper, feature_configs, device, mean, std,
-                 attribution_mode: str = 'pairwise', eg_samples: int = 24, n_steps: int = 32):
+                 attribution_mode: str = 'pairwise', eg_samples: int = 24, n_steps: int = 32,
+                 eg_baseline_chunk: int = 4):
         self.model = model
         self.device = device
         self.radiomics_features_extractor = RadiomicsFeatureExtractor()
@@ -41,6 +42,10 @@ class SaliencyMapGenerator:
         self.attribution_mode = attribution_mode
         self.eg_samples = eg_samples
         self.default_n_steps = n_steps
+        # Number of EG baselines whose Integrated Gradients are computed in a single
+        # batched captum call. Larger values trade GPU memory for throughput; 1 falls
+        # back to the original one-call-per-baseline loop.
+        self.eg_baseline_chunk = max(1, int(eg_baseline_chunk))
         self.baseline_pool = None  # [P, D] vectorized training texture matrices
         self.margin_target = MultiClassIGTarget(self.wrapped_mlp, mode=attribution_mode).to(device)
         self.margin_integrated_gradients = IntegratedGradients(self.margin_target)
@@ -96,13 +101,51 @@ class SaliencyMapGenerator:
 
     def _attribute_with_baselines(self, inputs, n_steps, baseline_indices):
         """Expected Gradients: average IG over the given pool baselines (targets
-        must already be set on ``self.margin_target``)."""
-        attributions = torch.zeros_like(inputs)
-        for b in baseline_indices:
-            baseline = self.baseline_pool[b:b + 1].expand_as(inputs).contiguous()
-            attributions = attributions + self.margin_integrated_gradients.attribute(
-                inputs, baselines=baseline, target=0, n_steps=n_steps)
-        return attributions / float(len(baseline_indices))
+        must already be set on ``self.margin_target``).
+
+        Baselines are processed in chunks of ``self.eg_baseline_chunk`` so several
+        ``(input, baseline)`` pairs share one Integrated Gradients call. This is
+        mathematically identical to attributing each baseline separately — the model
+        is strictly per-example, so a row's gradient is unaffected by the other rows
+        in the batch — but keeps the GPU far better utilised. ``chunk == 1`` reproduces
+        the original per-baseline loop exactly. On CUDA OOM it retries with ``chunk=1``."""
+        chunk = max(1, int(self.eg_baseline_chunk))
+        try:
+            return self._attribute_with_baselines_chunked(inputs, n_steps, baseline_indices, chunk)
+        except RuntimeError as error:
+            if chunk > 1 and 'out of memory' in str(error).lower():
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                print(f'EG baseline chunk={chunk} ran out of memory; retrying with chunk=1.')
+                return self._attribute_with_baselines_chunked(inputs, n_steps, baseline_indices, 1)
+            raise
+
+    def _attribute_with_baselines_chunked(self, inputs, n_steps, baseline_indices, chunk):
+        num_examples = inputs.shape[0]
+        # The predicted class / competitor indices depend only on the input example,
+        # so tile the per-example targets to match the [chunk * num_examples] batch.
+        base_c = self.margin_target._c_idx
+        base_r = self.margin_target._r_idx
+        total = torch.zeros_like(inputs)
+        num_baselines = len(baseline_indices)
+        try:
+            for start in range(0, num_baselines, chunk):
+                chunk_indices = baseline_indices[start:start + chunk]
+                k = len(chunk_indices)
+                # Row p of the tiled batch pairs input (p % num_examples) with
+                # baseline chunk_indices[p // num_examples].
+                tiled_inputs = inputs.repeat(k, 1)
+                tiled_baselines = self.baseline_pool[chunk_indices].repeat_interleave(num_examples, dim=0)
+                self.margin_target.set_targets(
+                    base_c.repeat(k),
+                    None if base_r is None else base_r.repeat(k))
+                attributions = self.margin_integrated_gradients.attribute(
+                    tiled_inputs, baselines=tiled_baselines, target=0, n_steps=n_steps)
+                total = total + attributions.reshape(k, num_examples, -1).sum(dim=0)
+        finally:
+            # Leave the caller's margin_target holding the untiled per-example targets.
+            self.margin_target.set_targets(base_c, base_r)
+        return total / float(num_baselines)
 
     def _attribute_batch(self, inputs, c_idx, n_steps):
         """Per-cell attributions for a batch using the configured multi-class target
@@ -322,16 +365,6 @@ class SaliencyMapGenerator:
             'relativeInputStability': [],
             'sparseness': []
         }
-        faithfulness_correlation = quantus.FaithfulnessCorrelation(
-            nr_runs=10,
-            subset_size=1,
-            perturb_baseline="black",
-            similarity_func=quantus.similarity_func.correlation_pearson,
-            abs=False,
-            normalise=False,
-            aggregate_func=np.mean,
-            return_aggregate=True,
-        )
         relative_input_stability = quantus.RelativeInputStability(
             nr_samples=2
         )
@@ -339,13 +372,35 @@ class SaliencyMapGenerator:
         self.wrapped_model.eval()
         width, height = images.shape[1:]
 
-        metrics_list = [
-            ('faithfulnessCorrelation', faithfulness_correlation),
-            ('relativeInputStability', relative_input_stability),
-            ('sparseness', sparseness)
-        ]
-
         for i in tqdm(range(images.shape[0])):
+            # Scale the faithfulness subset to the map's own support: 1/20 of the non-zero
+            # attribution pixels, over 20 runs. The previous nr_runs=10 / subset_size=1
+            # setting estimated a Pearson correlation from only 10 single-pixel black-outs,
+            # which for a global-texture model produces noise-level logit deltas and a very
+            # high-variance (often spuriously negative) correlation. Perturbing a patch
+            # drawn from the attributed region makes each logit delta measurable and the
+            # estimate far more stable.
+            # The subset is capped at height-1 because quantus asserts subset_size < the
+            # last input dimension for our (1, width, height) layout (it raises ValueError
+            # otherwise); dense maps therefore saturate at that cap.
+            nonzero = int(np.count_nonzero(maps[i]))
+            subset_size = min(max(1, nonzero // 20), height - 1)
+            faithfulness_correlation = quantus.FaithfulnessCorrelation(
+                nr_runs=20,
+                subset_size=subset_size,
+                perturb_baseline="black",
+                similarity_func=quantus.similarity_func.correlation_pearson,
+                abs=False,
+                normalise=False,
+                aggregate_func=np.mean,
+                return_aggregate=True,
+                disable_warnings=True,
+            )
+            metrics_list = [
+                ('faithfulnessCorrelation', faithfulness_correlation),
+                ('relativeInputStability', relative_input_stability),
+                ('sparseness', sparseness)
+            ]
             for metric_name, executor in metrics_list:
                 try:
                     metric_value = executor(

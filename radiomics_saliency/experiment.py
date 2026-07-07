@@ -19,6 +19,15 @@ from radiomics_saliency.training import train_and_evaluate_model
 from radiomics_saliency.visualization import blend_image_with_mask, prepare_images_for_serialization
 
 
+def _load_cached_saliency_maps(cache_path: str, description: str):
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f'{description} cache not found at {cache_path}. Run with run_saliency=True '
+            f'first to generate it, or point model_path at a directory that already has it.'
+        )
+    return np.load(cache_path)
+
+
 def run_experiment(
         images: np.ndarray,
         labels: np.ndarray,
@@ -29,8 +38,19 @@ def run_experiment(
         device: torch.device,
         model_path: str, **kwargs):
     # images: (N, H, W), labels: (N, 1)
+    # The texture-matrix and saliency-map routines key every column dimension off a single
+    # width and several Rust routines assume height == width; non-square images would
+    # silently mis-shape or panic deep in the extension. Fail loudly and early instead.
+    for name, batch in (('train/dev', images), ('test', test_images)):
+        if batch.shape[1] != batch.shape[2]:
+            raise ValueError(
+                f'{name} images must be square (height == width); got '
+                f'{batch.shape[1]}x{batch.shape[2]}. The radiomics pipeline is square-only.')
     image_max_width = images.shape[1]
     test_ids = kwargs.pop('test_ids', None)
+    run_saliency = kwargs.pop('run_saliency', True)
+    run_roar = kwargs.pop('run_roar', True)
+    run_metrics = kwargs.pop('run_metrics', True)
     extraction_parameters = [
         ('glcm', {'angle': 0, 'distance': 1, 'omit_zeros': True }),
         ('glcm', {'angle': 0, 'distance': 2, 'omit_zeros': True }),
@@ -38,6 +58,7 @@ def run_experiment(
         ('glcm', { 'angle': 90, 'distance': 1, 'omit_zeros': True }),
         ('glcm', { 'angle': 135, 'distance': 1, 'omit_zeros': True }),
         ('glrlm', {'omit_zeros': True}),
+        ('glszm', {'omit_zeros': True, 'max_size': image_max_width}),
         ('gldm', {'alpha': 1, 'delta': 3, 'omit_zeros': True}),
         ('gldm', { 'alpha': 1, 'delta': 5, 'omit_zeros': True }),
         ('gldm', {'alpha': 2, 'delta': 3, 'omit_zeros': True}),
@@ -61,105 +82,130 @@ def run_experiment(
     )
     feature_count = features.shape[1]
 
+    if not (run_saliency or run_roar or run_metrics):
+        print('Skipping saliency generation, ROAR, and metrics steps as requested.')
+        return
+
     # Step 2: Generate saliency maps for train and dev sets
-    print('Generating saliency maps for train and dev sets...')
     explanation_wrapper = ExplanationWrapper(model, extraction_parameters, m, s)
     saliency_map_generator = SaliencyMapGenerator(
         model, explanation_wrapper, extraction_parameters, device, m, s,
         attribution_mode=kwargs.get('attribution_mode', 'pairwise'),
-        eg_samples=int(kwargs.get('eg_samples', 24)),
-        n_steps=int(kwargs.get('saliency_n_steps', 32)))
+        eg_samples=int(kwargs.get('eg_samples', 10)),
+        n_steps=int(kwargs.get('saliency_n_steps', 20)),
+        eg_baseline_chunk=int(kwargs.get('eg_baseline_chunk', 4)))
     # Expected-Gradients baseline pool built from real training images.
     saliency_map_generator.set_baseline_pool(
         images[indices_train], sample_size=int(kwargs.get('eg_baseline_pool', 64)))
-    saliency_map_generator.set_profiling(kwargs.get('profile_saliency', False))
+    saliency_map_generator.set_profiling(kwargs.get('profile_saliency', True))
     saliency_map_generator.reset_profile_stats()
 
     predicted_labels_train, _, _ = model_trainer.eval_model_by_indices(indices_train)
     predicted_labels_dev, _, _ = model_trainer.eval_model_by_indices(indices_dev)
     predicted_labels_test, _, _ = model_trainer.eval_test_model()
 
-    train_saliency_maps = generate_and_cache_saliency_maps(
-        images[indices_train], predicted_labels_train, saliency_map_generator,
-        f'{model_path}/maps/train_saliency_raw.npy', 'Train saliency maps', **kwargs
-    )
+    if run_saliency:
+        print('Generating saliency maps for train and dev sets...')
+        train_saliency_maps = generate_and_cache_saliency_maps(
+            images[indices_train], predicted_labels_train, saliency_map_generator,
+            f'{model_path}/maps/train_saliency_raw.npy', 'Train saliency maps', **kwargs
+        )
 
-    dev_saliency_maps = generate_and_cache_saliency_maps(
-        images[indices_dev], predicted_labels_dev, saliency_map_generator,
-        f'{model_path}/maps/dev_saliency_raw.npy', 'Dev saliency maps', **kwargs
-    )
+        dev_saliency_maps = generate_and_cache_saliency_maps(
+            images[indices_dev], predicted_labels_dev, saliency_map_generator,
+            f'{model_path}/maps/dev_saliency_raw.npy', 'Dev saliency maps', **kwargs
+        )
 
-    test_saliency_maps = generate_and_cache_saliency_maps(
-        test_images, predicted_labels_test, saliency_map_generator,
-        f'{model_path}/maps/test_saliency_raw.npy', 'Test saliency maps', **kwargs
-    )
-    if kwargs.get('profile_saliency', False):
-        with open(f'{model_path}/saliency_profile.json', 'w') as f:
-            json.dump(saliency_map_generator.get_profile_stats(), f, indent=2)
+        test_saliency_maps = generate_and_cache_saliency_maps(
+            test_images, predicted_labels_test, saliency_map_generator,
+            f'{model_path}/maps/test_saliency_raw.npy', 'Test saliency maps', **kwargs
+        )
+        if kwargs.get('profile_saliency', True):
+            with open(f'{model_path}/saliency_profile.json', 'w') as f:
+                json.dump(saliency_map_generator.get_profile_stats(), f, indent=2)
 
-    # Completeness diagnostic: how well the attributions satisfy the IG identity
-    # sum(A) == g(x) - mean_baseline g(baseline) for the configured target scalar.
-    completeness_sample = min(int(kwargs.get('completeness_sample', 16)), test_images.shape[0])
-    if completeness_sample > 0:
-        completeness_error = saliency_map_generator.compute_completeness(
-            test_images[:completeness_sample], predicted_labels_test[:completeness_sample])
-        print(f'Mean relative completeness error: {completeness_error:.4f} '
-              f'(mode={saliency_map_generator.attribution_mode}, n_steps={saliency_map_generator.default_n_steps}, '
-              f'eg_samples={saliency_map_generator.eg_samples})')
-        with open(f'{model_path}/completeness.json', 'w') as f:
-            json.dump({
-                'mean_relative_completeness_error': completeness_error,
-                'attribution_mode': saliency_map_generator.attribution_mode,
-                'n_steps': saliency_map_generator.default_n_steps,
-                'eg_samples': saliency_map_generator.eg_samples,
-                'sample_size': completeness_sample,
-            }, f, indent=2)
+        # Completeness diagnostic: how well the attributions satisfy the IG identity
+        # sum(A) == g(x) - mean_baseline g(baseline) for the configured target scalar.
+        completeness_sample = min(int(kwargs.get('completeness_sample', 16)), test_images.shape[0])
+        if completeness_sample > 0:
+            completeness_error = saliency_map_generator.compute_completeness(
+                test_images[:completeness_sample], predicted_labels_test[:completeness_sample])
+            print(f'Mean relative completeness error: {completeness_error:.4f} '
+                  f'(mode={saliency_map_generator.attribution_mode}, n_steps={saliency_map_generator.default_n_steps}, '
+                  f'eg_samples={saliency_map_generator.eg_samples})')
+            with open(f'{model_path}/completeness.json', 'w') as f:
+                json.dump({
+                    'mean_relative_completeness_error': completeness_error,
+                    'attribution_mode': saliency_map_generator.attribution_mode,
+                    'n_steps': saliency_map_generator.default_n_steps,
+                    'eg_samples': saliency_map_generator.eg_samples,
+                    'sample_size': completeness_sample,
+                }, f, indent=2)
+    else:
+        print('Skipping saliency map generation; loading cached saliency maps...')
+        train_saliency_maps = _load_cached_saliency_maps(
+            f'{model_path}/maps/train_saliency_raw.npy', 'Train saliency maps')
+        dev_saliency_maps = _load_cached_saliency_maps(
+            f'{model_path}/maps/dev_saliency_raw.npy', 'Dev saliency maps')
+        test_saliency_maps = _load_cached_saliency_maps(
+            f'{model_path}/maps/test_saliency_raw.npy', 'Test saliency maps')
 
-    # Step 3: Remove top 10% pixels and retrain to assess accuracy change
-    print('Removing top 10% pixels based on saliency maps...')
+    if not (run_roar or run_metrics):
+        print('Skipping ROAR and metrics steps as requested.')
+        return
 
-    exclusion_masks = np.zeros_like(images, dtype='uint8')
-    exclusion_masks[indices_train] = build_high_saliency_exclusion_masks(
-        images[indices_train], train_saliency_maps, percentile=90)
-    exclusion_masks[indices_dev] = build_high_saliency_exclusion_masks(
-        images[indices_dev], dev_saliency_maps, percentile=90)
-    test_exclusion_masks = build_high_saliency_exclusion_masks(
-        test_images, test_saliency_maps, percentile=90)
-    images_modified = images.copy()
-    images_modified[exclusion_masks == 1] = 0
-    test_images_modified = test_images.copy()
-    test_images_modified[test_exclusion_masks == 1] = 0
-    images_modified_to_save = prepare_images_for_serialization(images_modified)
-    test_images_modified_to_save = prepare_images_for_serialization(test_images_modified)
+    if not run_roar:
+        print('Skipping ROAR (remove-and-retrain) step.')
+    else:
+        # Step 3: Remove top 10% pixels and retrain to assess accuracy change
+        print('Removing top 10% pixels based on saliency maps...')
 
-    # Save modified images to disk for inspection and reproducibility
-    os.makedirs(f'{model_path}/retrained/modified_train_dev_images', exist_ok=True)
-    os.makedirs(f'{model_path}/retrained/modified_test_images', exist_ok=True)
-    np.save(f'{model_path}/retrained/train_dev_exclusion_masks.npy', exclusion_masks)
-    np.save(f'{model_path}/retrained/test_exclusion_masks.npy', test_exclusion_masks)
-    np.save(f'{model_path}/retrained/modified_train_dev_images.npy', images_modified_to_save)
-    np.save(f'{model_path}/retrained/modified_test_images.npy', test_images_modified_to_save)
-    # Also save individual PNG visualizations
-    for ii in range(images_modified_to_save.shape[0]):
-        img = images_modified_to_save[ii]
-        img_rgba = gray2rgba(img)
-        skio.imsave(f'{model_path}/retrained/modified_train_dev_images/{ii}_modified.png', img_rgba)
-    for ii in range(test_images_modified_to_save.shape[0]):
-        img = test_images_modified_to_save[ii]
-        img_rgba = gray2rgba(img)
-        skio.imsave(f'{model_path}/retrained/modified_test_images/{ii}_modified.png', img_rgba)
+        exclusion_masks = np.zeros_like(images, dtype='uint8')
+        exclusion_masks[indices_train] = build_high_saliency_exclusion_masks(
+            images[indices_train], train_saliency_maps, percentile=90)
+        exclusion_masks[indices_dev] = build_high_saliency_exclusion_masks(
+            images[indices_dev], dev_saliency_maps, percentile=90)
+        test_exclusion_masks = build_high_saliency_exclusion_masks(
+            test_images, test_saliency_maps, percentile=90)
+        images_modified = images.copy()
+        images_modified[exclusion_masks == 1] = 0
+        test_images_modified = test_images.copy()
+        test_images_modified[test_exclusion_masks == 1] = 0
+        images_modified_to_save = prepare_images_for_serialization(images_modified)
+        test_images_modified_to_save = prepare_images_for_serialization(test_images_modified)
 
-    print('Retraining model with modified images to assess accuracy change...')
-    os.makedirs(f'{model_path}/retrained', exist_ok=True)
-    model_retrained, model_trainer_retrained, _, _, _, _ = train_and_evaluate_model(
-        images, labels, indices_train, indices_dev, test_images, test_labels,
-        extraction_parameters, device, f'{model_path}/retrained', feature_count,
-        unique_labels, kwargs['skip_training'], kwargs['model_type_name'],
-        masks=exclusion_masks, test_masks=test_exclusion_masks
-    )
+        # Save modified images to disk for inspection and reproducibility
+        os.makedirs(f'{model_path}/retrained/modified_train_dev_images', exist_ok=True)
+        os.makedirs(f'{model_path}/retrained/modified_test_images', exist_ok=True)
+        np.save(f'{model_path}/retrained/train_dev_exclusion_masks.npy', exclusion_masks)
+        np.save(f'{model_path}/retrained/test_exclusion_masks.npy', test_exclusion_masks)
+        np.save(f'{model_path}/retrained/modified_train_dev_images.npy', images_modified_to_save)
+        np.save(f'{model_path}/retrained/modified_test_images.npy', test_images_modified_to_save)
+        # Also save individual PNG visualizations
+        for ii in range(images_modified_to_save.shape[0]):
+            img = images_modified_to_save[ii]
+            img_rgba = gray2rgba(img)
+            skio.imsave(f'{model_path}/retrained/modified_train_dev_images/{ii}_modified.png', img_rgba)
+        for ii in range(test_images_modified_to_save.shape[0]):
+            img = test_images_modified_to_save[ii]
+            img_rgba = gray2rgba(img)
+            skio.imsave(f'{model_path}/retrained/modified_test_images/{ii}_modified.png', img_rgba)
 
-    # Save retrained model metrics for comparison
-    print('Retrained model evaluation completed. Metrics saved to retrained/ directory.')
+        print('Retraining model with modified images to assess accuracy change...')
+        os.makedirs(f'{model_path}/retrained', exist_ok=True)
+        model_retrained, model_trainer_retrained, _, _, _, _ = train_and_evaluate_model(
+            images, labels, indices_train, indices_dev, test_images, test_labels,
+            extraction_parameters, device, f'{model_path}/retrained', feature_count,
+            unique_labels, kwargs['skip_training'], kwargs['model_type_name'],
+            masks=exclusion_masks, test_masks=test_exclusion_masks
+        )
+
+        # Save retrained model metrics for comparison
+        print('Retrained model evaluation completed. Metrics saved to retrained/ directory.')
+
+    if not run_metrics:
+        print('Skipping activation map, visualization, and metrics steps.')
+        return
 
     # Step 4: Continue with original model for saliency map generation
     print('Generating test set saliency and activation maps using original model...')

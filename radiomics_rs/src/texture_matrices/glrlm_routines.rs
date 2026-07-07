@@ -38,7 +38,9 @@ pub fn glrlm(image: ArrayViewD<u8>, omit_zeros: bool, mask: Option<ArrayViewD<u8
                 true => 0
             };
             if next_val != now_val && counter == 0 {
-                if !run_masked {
+                // Single-pixel run. Honour omit_zeros here too (as finish_run_length does
+                // for longer runs) so isolated background pixels don't leak into row 0.
+                if !run_masked && (!omit_zeros || now_val != 0) {
                     matrix[[now_val as usize,counter as usize]] += 1
                 }
                 run_masked = false;

@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Python File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/statistical_radiomics_saliency_maps.py",
+            "args": [
+                "-b", "0",
+                "-e", "1",
+                "-d", "0",
+                "-dn", "raw_tuberculosis",
+                "-dt", "C:/Projects/phd/image_processing/datasets/shenzen_montgomery/images",
+                "-r", "./results/raw_tuberculosis",
+                "-m", "mlp"
+            ],
+            "justMyCode": false
+        }
+    ]
+}

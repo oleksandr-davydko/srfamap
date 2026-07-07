@@ -23,7 +23,6 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--device', type=int)
     parser.add_argument('-dt', '--datapath', type=str)
     parser.add_argument('-dn', '--datasetname', type=str)
-    parser.add_argument('-f', '--features', type=str)
     parser.add_argument('-a', '--alpha', type=int, default=0)
     parser.add_argument('-dl', '--delta', type=int, default=1)
     parser.add_argument('-z', '--omitzeros', type=bool, default=True)
@@ -36,15 +35,26 @@ if __name__ == '__main__':
                         choices=['pairwise', 'ovr_margin', 'logit'],
                         help="Multi-class IG target: pairwise (predicted vs runner-up), "
                              "ovr_margin (predicted vs rest), or logit (raw class logit).")
-    parser.add_argument('--eg-samples', type=int, default=24,
+    parser.add_argument('--eg-samples', type=int, default=1,
                         help='Number of Expected-Gradients baselines averaged per attribution.')
     parser.add_argument('--eg-baseline-pool', type=int, default=64,
                         help='Number of training images sampled to form the EG baseline pool.')
-    parser.add_argument('--completeness-sample', type=int, default=16,
+    parser.add_argument('--eg-baseline-chunk', type=int, default=4,
+                        help='Number of EG baselines whose Integrated Gradients are computed in a '
+                             'single batched call. Higher = faster but more GPU memory; 1 disables '
+                             'batching. Falls back to 1 automatically on out-of-memory.')
+    parser.add_argument('--completeness-sample', type=int, default=0,
                         help='Number of test images used for the completeness diagnostic (0 to skip).')
     parser.add_argument('--profile-saliency', action='store_true')
+    parser.add_argument('--skip-saliency-generation', action='store_true',
+                        help='Skip generating train/dev/test saliency maps; reuse cached maps '
+                             'from a previous run (required if ROAR or metrics steps are enabled).')
+    parser.add_argument('--skip-roar', action='store_true',
+                        help='Skip the ROAR (remove-top-saliency-pixels-and-retrain) step.')
+    parser.add_argument('--skip-metrics', action='store_true',
+                        help='Skip activation map generation, visualization, and faithfulness '
+                             'metric computation.')
     args = parser.parse_args()
-    model_name = f'{args.features}'
     config.device = torch.device(f'cuda:{args.device}')
     train_dev_images, train_dev_labels, heldout_test_images, heldout_test_labels, heldout_test_ids = \
         load_dataset_with_heldout_test(args.datasetname, args.datapath)
@@ -65,7 +75,7 @@ if __name__ == '__main__':
             stratify=train_dev_labels.reshape(-1)
         )
 
-        result_dir = f'{args.resultdir}{model_name}/{iteration}'
+        result_dir = f'{args.resultdir}/{iteration}'
         os.makedirs(result_dir, exist_ok=True)
 
         run_experiment(train_dev_images, train_dev_labels, indices_train, indices_dev,
@@ -78,5 +88,9 @@ if __name__ == '__main__':
                        attribution_mode=args.attribution_mode,
                        eg_samples=args.eg_samples,
                        eg_baseline_pool=args.eg_baseline_pool,
+                       eg_baseline_chunk=args.eg_baseline_chunk,
                        completeness_sample=args.completeness_sample,
-                       profile_saliency=args.profile_saliency)
+                       profile_saliency=args.profile_saliency,
+                       run_saliency=not args.skip_saliency_generation,
+                       run_roar=not args.skip_roar,
+                       run_metrics=not args.skip_metrics)

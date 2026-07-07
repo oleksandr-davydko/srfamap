@@ -55,6 +55,10 @@ The script exposes the following command-line arguments:
 - `--saliency-batch-size`: Batch size used during saliency-map generation. Default: `4`.
 - `--saliency-n-steps`: Number of Integrated Gradients steps used for saliency generation. Default: `5`.
 - `--profile-saliency`: Enable timing/profiling output for saliency and activation map generation. When enabled, profiling data is written to `saliency_profile.json`.
+- `--skip-saliency-generation`: Skip generating train/dev/test saliency maps and reuse the cached `.npy` maps from a previous run. Required if the ROAR or metrics steps are enabled but saliency generation is skipped.
+- `--skip-roar`: Skip the ROAR (remove top-saliency pixels and retrain) step.
+- `--skip-metrics`: Skip activation map generation, visualization, and faithfulness metric computation.
+- `--eg-baseline-chunk`: Number of Expected-Gradients baselines whose Integrated Gradients are computed in a single batched call during saliency generation. Higher values are faster but use more GPU memory; `1` disables batching (one call per baseline). Automatically falls back to `1` on an out-of-memory error. Default: `4`.
 
 ## Dataset-Specific Inputs
 

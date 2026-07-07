@@ -27,12 +27,16 @@ pub fn glcm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, a
     }
     let width = image.shape()[1];
     let height = image.shape()[0];
-    let mut map = Array2::zeros((width, height));
+    // map is indexed as map[[row, col]] with row in 0..height, col in 0..width, so it
+    // must be allocated (height, width). i_index is a row index (bound by height) and
+    // j_index a column index (bound by width); the previous code transposed both, which
+    // was harmless only because the images are square.
+    let mut map = Array2::zeros((height, width));
     for i in 0..height-distance {
         for j in 0..width-distance {
             let first_pixel = image[[i, j]];
             let (i_index, j_index) = get_next_pair_coordinates(i, j, distance, angle);
-            if i_index < 0 || i_index >= width || j_index < 0 || j_index >= height {
+            if i_index >= height || j_index >= width {
                 continue;
             }
             let second_pixel = image[[i_index, j_index]];

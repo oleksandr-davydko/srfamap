@@ -11,7 +11,7 @@ pub fn ngtdm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, 
         Axis(1), Array2::zeros((width + 2 * delta, delta)), padded, Array2::zeros((width + 2 * delta, delta))
     ];
     let mut padded_map = concatenate![
-        Axis(0), Array2::zeros((delta, height)), Array2::zeros((height, width)), Array2::zeros((delta, height))
+        Axis(0), Array2::zeros((delta, height)), Array2::zeros((width, height)), Array2::zeros((delta, height))
     ];
     padded_map = concatenate![
         Axis(1), Array2::zeros((width + 2 * delta, delta)), padded_map, Array2::zeros((width + 2 * delta, delta))
@@ -43,5 +43,7 @@ pub fn ngtdm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, 
             map_slice += &map_attributions;
         }
     }
-    padded_map.slice(s![delta..delta+height,delta..delta+width]).to_owned()
+    // width = rows (shape[0]), height = cols (shape[1]); crop each axis by its own extent
+    // (previously transposed, correct only for square images).
+    padded_map.slice(s![delta..delta+width, delta..delta+height]).to_owned()
 }

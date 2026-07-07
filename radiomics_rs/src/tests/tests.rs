@@ -5,6 +5,8 @@ use ndarray_npy::{read_npy, ReadNpyError, ReadNpyExt, WriteNpyError, WriteNpyExt
 use std::fs::File;
 use ndarray::s;
 use crate::explanations::ngtdm_saliency_map::ngtdm_saliency_map;
+use crate::explanations::glrlm_saliency_map_routines::glrlm_saliency_map;
+use crate::explanations::gldm_saliency_map::gldm_saliency_map;
 use crate::texture_matrices::glcm::glcm;
 use crate::texture_matrices::gldm_routines::gldm;
 use crate::texture_matrices::glszm_routines::glszm;
@@ -310,4 +312,64 @@ fn test_glszm_masked_excludes_zone() {
     let (masked, _) = glszm(image.view(), false, 10, Some(mask.view()));
 
     assert!(unmasked.sum() > masked.sum());
+}
+
+#[test]
+fn test_glrlm_saliency_map_credits_full_run() {
+    // Regression test for the run back-projection off-by-one (B1): every pixel of a
+    // run must receive the run's attribution, including the final pixel. On [2, 2, 1]
+    // the length-2 run of 2's must credit BOTH pixels 0 and 1 (not just pixel 0).
+    let image = Array2::from(vec![[2u8, 2, 1]]).into_dyn();
+    let mut attributions = Array2::<f32>::zeros((256, 4));
+    attributions[[2, 1]] = 10.0; // run of two 2's: length 2 -> column 1
+    attributions[[1, 0]] = 5.0;  // single 1: length 1 -> column 0
+    let attributions = attributions.into_dyn();
+
+    let map = glrlm_saliency_map(image.view(), attributions.view(), true, None);
+
+    let expected = Array2::from(vec![[10.0f32, 10.0, 5.0]]);
+    assert_eq!(map, expected);
+}
+
+#[test]
+fn test_glrlm_omit_zeros_excludes_background_singletons() {
+    // B4: with omit_zeros, an isolated background (0) pixel must be excluded from the
+    // GLRLM matrix (row 0) in the forward AND receive no attribution in the map, keeping
+    // the two consistent. On [3, 0, 3] the middle background pixel must stay uncredited.
+    let image = Array2::from(vec![[3u8, 0, 3]]).into_dyn();
+
+    let matrix = glrlm(image.view(), true, None);
+    assert_eq!(matrix[[0, 0]], 0); // background singleton not counted
+    assert_eq!(matrix[[3, 0]], 2); // the two isolated 3's
+
+    let mut attributions = Array2::<f32>::zeros((256, 4));
+    attributions[[3, 0]] = 7.0;
+    attributions[[0, 0]] = 99.0; // must never be applied
+    let attributions = attributions.into_dyn();
+    let map = glrlm_saliency_map(image.view(), attributions.view(), true, None);
+
+    let expected = Array2::from(vec![[7.0f32, 0.0, 7.0]]);
+    assert_eq!(map, expected);
+}
+
+#[test]
+fn test_gldm_saliency_map_credits_only_dependent_pixels() {
+    // B3: attribution must land only on the dependent pixels (|central - e| <= alpha),
+    // not the whole (2*delta+1)^2 window. With alpha=0 and all-distinct values every
+    // pixel is dependent only on itself, so a bin set for the centre pixel (value 5,
+    // dependency count 1) must credit ONLY the centre pixel, not its 8 neighbours.
+    let image = Array2::from(vec![
+        [1u8, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+    ]).into_dyn();
+    let mut attributions = Array2::<f32>::zeros((256, 16));
+    attributions[[5, 1]] = 100.0;
+    let attributions = attributions.into_dyn();
+
+    let map = gldm_saliency_map(image.view(), attributions.view(), 0, 1, false, None);
+
+    let mut expected = Array2::<f32>::zeros((3, 3));
+    expected[[1, 1]] = 100.0;
+    assert_eq!(map, expected);
 }

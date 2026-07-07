@@ -19,7 +19,9 @@ pub fn glrlm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, 
                 true => 0
             };
             if next_val != now_val && counter == 0 {
-                if !run_masked {
+                // Single-pixel run. Mirror the forward's omit_zeros handling so isolated
+                // background pixels are neither counted (row 0) nor credited here.
+                if ((!omit_zeros && now_val == 0) || now_val != 0) && !run_masked {
                     map[[i, j]] = attributions[[now_val as usize, counter]]
                 }
                 run_masked = false;
@@ -27,7 +29,9 @@ pub fn glrlm_saliency_map(image: ArrayViewD<u8>, attributions: ArrayViewD<f32>, 
                 counter += 1
             } else {
                 if ((!omit_zeros && now_val == 0) || now_val != 0) && !run_masked {
-                    let mut slice = map.slice_mut(s![i, (j-counter)..j]);
+                    // The run spans pixels [j-counter, j] inclusive (counter+1 pixels);
+                    // the upper bound must be j+1 so the final pixel of the run is credited.
+                    let mut slice = map.slice_mut(s![i, (j-counter)..(j+1)]);
                     slice += attributions[[now_val as usize, counter]];
                 }
                 counter = 0;

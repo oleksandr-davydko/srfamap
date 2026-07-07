@@ -82,13 +82,19 @@ class GlcmFeatures(torch.nn.Module):
         imc2 = torch.sqrt_(1 - torch.exp_(-2 * (hxy2 - hxy)))
         k_indexes = self.difference_index.to(x_normed.dtype)
         idm = torch.sum(p_x_minus_y / (1 + k_indexes ** 2), dim=1)
-        maximal_correlation_coefficient = torch.zeros((x.shape[0],)).to(self.dummy_param.device)
-        for indexer in range(x.shape[0]):
-            normalized_rows = x_normed[indexer] / (px[indexer].unsqueeze(1) + sys.float_info.epsilon)
-            normalized_cols = x_normed[indexer] / (py[indexer].unsqueeze(0) + sys.float_info.epsilon)
-            q = normalized_rows @ normalized_cols.transpose(0, 1)
-            eig = torch.linalg.eigvals(q).real.to(torch.float32)
-            maximal_correlation_coefficient[indexer] = torch.sqrt_(eig[torch.argsort(eig, dim=0)[-2]].clamp_min(0))
+        # Maximal Correlation Coefficient: eigenvalues of Q = R @ C^T per example, where
+        # R normalizes each row by px and C each column by py. This is batched over the
+        # whole batch dimension so the (expensive, autograd-heavy) eigendecomposition runs
+        # as a single fused call instead of a Python loop of per-example eigvals — the
+        # dominant cost when Integrated Gradients backpropagates through this layer.
+        # Numerically identical to the per-example formulation.
+        normalized_rows = x_normed / (px.unsqueeze(2) + sys.float_info.epsilon)
+        normalized_cols = x_normed / (py.unsqueeze(1) + sys.float_info.epsilon)
+        q = torch.bmm(normalized_rows, normalized_cols.transpose(1, 2))
+        eig = torch.linalg.eigvals(q).real.to(torch.float32)
+        # Second largest eigenvalue per example (argsort ascending, take the runner-up).
+        second_largest = torch.sort(eig, dim=1).values[:, -2]
+        maximal_correlation_coefficient = torch.sqrt(second_largest.clamp_min(0))
         idmn = torch.sum(p_x_minus_y / (1 + ((k_indexes ** 2) / (self.gray_levels ** 2))), dim=1)
         id = torch.sum(p_x_minus_y / (1 + k_indexes), dim=1)
         idn = torch.sum(p_x_minus_y / (1 + (k_indexes / 9)), dim=1)
