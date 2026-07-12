@@ -3,10 +3,15 @@ import torch
 
 
 class GlcmFeatures(torch.nn.Module):
-    def __init__(self, gray_levels: int = 256):
+    def __init__(self, gray_levels: int = 256, mcc_power_iters: int = 20, mcc_subspace_block: int = 6):
         super().__init__()
         self.output_size = 24
         self.gray_levels = gray_levels
+        # Subspace (block power) iteration settings for the Maximal Correlation
+        # Coefficient. Iterations control how tightly the top-``block`` invariant
+        # subspace is converged before the second eigenvalue is read off.
+        self.mcc_power_iters = mcc_power_iters
+        self.mcc_subspace_block = mcc_subspace_block
         self.dummy_param = torch.nn.Parameter(torch.empty(0))
         self.register_buffer('difference_index', torch.arange(0, gray_levels - 1, dtype=torch.float32))
         self.register_buffer('sum_index', torch.arange(2, gray_levels * 2, dtype=torch.float32))
@@ -20,6 +25,59 @@ class GlcmFeatures(torch.nn.Module):
 
     def get_difference_entropy(self, p_x_minus_y) -> torch.Tensor:
         return -torch.sum(p_x_minus_y * torch.log2_(p_x_minus_y + sys.float_info.epsilon), dim=1)
+
+    def maximal_correlation_coefficient(self, x_normed, px, py) -> torch.Tensor:
+        """Maximal Correlation Coefficient: ``sqrt`` of the second-largest
+        eigenvalue of ``q = diag(1/px) @ x_normed @ diag(1/py) @ x_normed^T``.
+
+        ``q`` is not symmetric, but it is *similar* to the symmetric PSD matrix
+        ``S = G @ G^T`` with ``G = x_normed / (sqrt(px) * sqrt(py))`` (because
+        ``q = D1 (x_normed D2 x_normed^T)`` with positive diagonal ``D1`` factors
+        out as ``D1^{1/2} S D1^{-1/2}``), so it has the *same*, real, non-negative
+        eigenvalues. Instead of a full non-symmetric ``eigvals`` — whose forward is
+        O(n^3) and whose backward, evaluated at every Integrated Gradients step,
+        was the dominant cost of this layer — we recover only the top two
+        eigenvalues of ``S`` with matvec-only block power iteration:
+
+          * the invariant subspace ``V`` is converged under ``no_grad`` (its exact
+            value only needs to be accurate, not differentiable);
+          * the second eigenvalue is then returned as the Rayleigh quotient
+            ``u2^T S u2 = ||G^T u2||^2`` of the *detached* second Ritz vector,
+            whose gradient ``dλ = u2^T dS u2`` is exact at an eigenvector and flows
+            back through nothing more expensive than a single matmul.
+
+        Numerically equivalent to ``sort(eigvals(q).real)[-2]``.
+        """
+        eps = sys.float_info.epsilon
+        g = x_normed / (torch.sqrt(px.unsqueeze(2) + eps) * torch.sqrt(py.unsqueeze(1) + eps))
+        batch, n, _ = g.shape
+        block = max(2, min(self.mcc_subspace_block, n))
+        gt = g.transpose(1, 2)
+
+        def apply_s(mat):
+            # S @ mat = G @ (G^T @ mat), never forming the n*n matrix S.
+            return torch.bmm(g, torch.bmm(gt, mat))
+
+        with torch.no_grad():
+            # Deterministic, batch-position-independent initialisation so the
+            # attributions stay reproducible (relativeInputStability relies on it).
+            generator = torch.Generator(device=g.device).manual_seed(0)
+            v = torch.randn(1, n, block, generator=generator, device=g.device, dtype=g.dtype)
+            v = v.expand(batch, -1, -1).contiguous()
+            v, _ = torch.linalg.qr(v)
+            for _ in range(self.mcc_power_iters):
+                v, _ = torch.linalg.qr(apply_s(v))
+            # Rayleigh-Ritz: eigenpairs of the small block x block projection
+            # T = V^T S V = (G^T V)^T (G^T V); its eigenvalues are the top Ritz values.
+            w = torch.bmm(gt, v)
+            t = torch.bmm(w.transpose(1, 2), w)
+            _, ritz_vectors = torch.linalg.eigh(t)
+            # eigh is ascending; the second-largest Ritz vector lifted to full space.
+            u2 = torch.bmm(v, ritz_vectors[:, :, -2:-1])
+
+        gu = torch.bmm(gt, u2)
+        second_largest = torch.sum(gu * gu, dim=(1, 2))
+        return torch.sqrt(second_largest.clamp_min(0))
 
     def forward(self, inp):
         if inp.dim() == 4:
@@ -82,19 +140,11 @@ class GlcmFeatures(torch.nn.Module):
         imc2 = torch.sqrt_(1 - torch.exp_(-2 * (hxy2 - hxy)))
         k_indexes = self.difference_index.to(x_normed.dtype)
         idm = torch.sum(p_x_minus_y / (1 + k_indexes ** 2), dim=1)
-        # Maximal Correlation Coefficient: eigenvalues of Q = R @ C^T per example, where
-        # R normalizes each row by px and C each column by py. This is batched over the
-        # whole batch dimension so the (expensive, autograd-heavy) eigendecomposition runs
-        # as a single fused call instead of a Python loop of per-example eigvals — the
-        # dominant cost when Integrated Gradients backpropagates through this layer.
-        # Numerically identical to the per-example formulation.
-        normalized_rows = x_normed / (px.unsqueeze(2) + sys.float_info.epsilon)
-        normalized_cols = x_normed / (py.unsqueeze(1) + sys.float_info.epsilon)
-        q = torch.bmm(normalized_rows, normalized_cols.transpose(1, 2))
-        eig = torch.linalg.eigvals(q).real.to(torch.float32)
-        # Second largest eigenvalue per example (argsort ascending, take the runner-up).
-        second_largest = torch.sort(eig, dim=1).values[:, -2]
-        maximal_correlation_coefficient = torch.sqrt(second_largest.clamp_min(0))
+        # Maximal Correlation Coefficient: sqrt of the second-largest eigenvalue of
+        # Q = diag(1/px) @ x_normed @ diag(1/py) @ x_normed^T. Recovered via matvec-only
+        # block power iteration on the symmetric matrix similar to Q (see the method),
+        # replacing the full non-symmetric eigvals whose backward dominated this layer.
+        maximal_correlation_coefficient = self.maximal_correlation_coefficient(x_normed, px, py)
         idmn = torch.sum(p_x_minus_y / (1 + ((k_indexes ** 2) / (self.gray_levels ** 2))), dim=1)
         id = torch.sum(p_x_minus_y / (1 + k_indexes), dim=1)
         idn = torch.sum(p_x_minus_y / (1 + (k_indexes / 9)), dim=1)
