@@ -3,13 +3,15 @@ import torch
 
 
 class GlcmFeatures(torch.nn.Module):
-    def __init__(self, gray_levels: int = 256, mcc_power_iters: int = 20, mcc_subspace_block: int = 6):
+    def __init__(self, gray_levels: int = 256, mcc_power_iters: int = 30, mcc_subspace_block: int = 6):
         super().__init__()
         self.output_size = 24
         self.gray_levels = gray_levels
-        # Subspace (block power) iteration settings for the Maximal Correlation
-        # Coefficient. Iterations control how tightly the top-``block`` invariant
-        # subspace is converged before the second eigenvalue is read off.
+        # Orthogonal (block power) iteration settings for the Maximal Correlation
+        # Coefficient. ``block`` vectors are iterated together and QR-reorthonormalised
+        # each step, so the columns converge to the leading eigenvectors *in order*;
+        # more iterations converge them more tightly (matters only when the spectrum
+        # is clustered). block > 2 gives the 2nd eigenvector some margin.
         self.mcc_power_iters = mcc_power_iters
         self.mcc_subspace_block = mcc_subspace_block
         self.dummy_param = torch.nn.Parameter(torch.empty(0))
@@ -36,17 +38,27 @@ class GlcmFeatures(torch.nn.Module):
         out as ``D1^{1/2} S D1^{-1/2}``), so it has the *same*, real, non-negative
         eigenvalues. Instead of a full non-symmetric ``eigvals`` — whose forward is
         O(n^3) and whose backward, evaluated at every Integrated Gradients step,
-        was the dominant cost of this layer — we recover only the top two
-        eigenvalues of ``S`` with matvec-only block power iteration:
+        was the dominant cost of this layer — we recover only the leading
+        eigenvectors of ``S`` with orthogonal (block power) iteration plus a
+        Rayleigh-Ritz extraction:
 
-          * the invariant subspace ``V`` is converged under ``no_grad`` (its exact
-            value only needs to be accurate, not differentiable);
+          * a block of ``mcc_subspace_block`` vectors is iterated together and
+            QR-reorthonormalised each step, converging to the top invariant
+            subspace; a small ``block x block`` Rayleigh-Ritz solve then rotates
+            that subspace onto its eigenvectors and reads off the 2nd. All of this
+            runs under ``no_grad`` — the vectors only need to be accurate, not
+            differentiable — and Rayleigh-Ritz makes it converge in ~20 iterations
+            instead of the hundreds raw per-vector iteration would need;
           * the second eigenvalue is then returned as the Rayleigh quotient
-            ``u2^T S u2 = ||G^T u2||^2`` of the *detached* second Ritz vector,
-            whose gradient ``dλ = u2^T dS u2`` is exact at an eigenvector and flows
-            back through nothing more expensive than a single matmul.
+            ``u2^T S u2 = ||G^T u2||^2`` of the *detached* 2nd eigenvector, whose
+            gradient ``dλ = u2^T dS u2`` is exact at an eigenvector and flows back
+            through nothing more expensive than a single matmul.
 
-        Numerically equivalent to ``sort(eigvals(q).real)[-2]``.
+        The small symmetric solve is hardened (symmetrised + ``nan_to_num``) and, if
+        it still fails to converge on a degenerate spectrum (empty matrices,
+        repeated eigenvalues), falls back to the raw sorted 2nd subspace vector — so
+        this never raises the LAPACK errors a bare ``eigh`` throws. Numerically
+        equivalent to ``sort(eigvals(q).real)[-2]``.
         """
         eps = sys.float_info.epsilon
         g = x_normed / (torch.sqrt(px.unsqueeze(2) + eps) * torch.sqrt(py.unsqueeze(1) + eps))
@@ -59,25 +71,35 @@ class GlcmFeatures(torch.nn.Module):
             return torch.bmm(g, torch.bmm(gt, mat))
 
         with torch.no_grad():
-            # Deterministic, batch-position-independent initialisation so the
-            # attributions stay reproducible (relativeInputStability relies on it).
+            # Deterministic, batch-position-independent init so attributions stay
+            # reproducible (relativeInputStability relies on it).
             generator = torch.Generator(device=g.device).manual_seed(0)
             v = torch.randn(1, n, block, generator=generator, device=g.device, dtype=g.dtype)
             v = v.expand(batch, -1, -1).contiguous()
             v, _ = torch.linalg.qr(v)
             for _ in range(self.mcc_power_iters):
                 v, _ = torch.linalg.qr(apply_s(v))
-            # Rayleigh-Ritz: eigenpairs of the small block x block projection
-            # T = V^T S V = (G^T V)^T (G^T V); its eigenvalues are the top Ritz values.
+            # Rayleigh-Ritz: eigenpairs of the small projection T = V^T S V =
+            # (G^T V)^T (G^T V). Its eigenvalues are the top Ritz values (ascending),
+            # so the second-largest Ritz vector, lifted back by V, is the 2nd
+            # eigenvector of S. Symmetrise + sanitise T so the tiny eigh is stable.
             w = torch.bmm(gt, v)
             t = torch.bmm(w.transpose(1, 2), w)
-            _, ritz_vectors = torch.linalg.eigh(t)
-            # eigh is ascending; the second-largest Ritz vector lifted to full space.
-            u2 = torch.bmm(v, ritz_vectors[:, :, -2:-1])
+            t = torch.nan_to_num(0.5 * (t + t.transpose(1, 2)))
+            try:
+                _, ritz_vectors = torch.linalg.eigh(t)
+                u2 = torch.bmm(v, ritz_vectors[:, :, -2:-1])
+            except RuntimeError:
+                # Orthogonal iteration already sorts columns by eigenvalue; column 1
+                # is a (less tightly converged) second eigenvector. Never raises.
+                u2 = v[:, :, 1:2]
 
         gu = torch.bmm(gt, u2)
+        # eps floor keeps the sqrt gradient finite where the second eigenvalue is 0
+        # (degenerate/empty matrices); there the upstream gradient is 0, so the
+        # feature and its gradient both stay 0 instead of becoming inf/NaN.
         second_largest = torch.sum(gu * gu, dim=(1, 2))
-        return torch.sqrt(second_largest.clamp_min(0))
+        return torch.sqrt(second_largest.clamp_min(0) + eps)
 
     def forward(self, inp):
         if inp.dim() == 4:
