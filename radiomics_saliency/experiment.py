@@ -50,7 +50,18 @@ def run_experiment(
     test_ids = kwargs.pop('test_ids', None)
     run_saliency = kwargs.pop('run_saliency', True)
     run_roar = kwargs.pop('run_roar', True)
+    roar_sign = kwargs.pop('roar_sign', 'abs')
+    if roar_sign not in ('abs', 'positive', 'negative'):
+        raise ValueError(f"roar_sign must be 'abs', 'positive' or 'negative'; got '{roar_sign}'.")
     run_metrics = kwargs.pop('run_metrics', True)
+    # ROAR-only mode: re-run just the remove-and-retrain step on top of an existing run.
+    # The base model is loaded from its cached weights and the saliency maps from their
+    # cache, so nothing about the explanations is recomputed; only the ROAR retraining runs.
+    roar_only = kwargs.pop('roar_only', False)
+    if roar_only:
+        run_roar = True
+        run_saliency = False
+        run_metrics = False
     extraction_parameters = [
         ('glcm', {'angle': 0, 'distance': 1, 'omit_zeros': True }),
         ('glcm', {'angle': 0, 'distance': 2, 'omit_zeros': True }),
@@ -73,12 +84,21 @@ def run_experiment(
         np.asarray(test_labels).reshape(-1)
     ]))
 
-    # Step 1: Train initial model
-    print('Training initial model...')
+    # Step 1: Train initial model (or reuse the cached one in ROAR-only mode)
+    skip_base_training = bool(kwargs['skip_training']) or roar_only
+    if roar_only:
+        base_weights_path = f'{model_path}/weights.pth'
+        if not os.path.exists(base_weights_path):
+            raise FileNotFoundError(
+                f'ROAR-only mode needs the base model from a previous run, but '
+                f'{base_weights_path} does not exist. Run the full pipeline once first.')
+        print('ROAR-only mode: loading the cached base model instead of retraining it...')
+    else:
+        print('Training initial model...')
     model, model_trainer, features, test_features, m, s = train_and_evaluate_model(
         images, labels, indices_train, indices_dev, test_images, test_labels,
         extraction_parameters, device, model_path, None, unique_labels,
-        kwargs['skip_training'], kwargs['model_type_name']
+        skip_base_training, kwargs['model_type_name']
     )
     feature_count = features.shape[1]
 
@@ -157,16 +177,24 @@ def run_experiment(
     if not run_roar:
         print('Skipping ROAR (remove-and-retrain) step.')
     else:
-        # Step 3: Remove top 10% pixels and retrain to assess accuracy change
-        print('Removing top 10% pixels based on saliency maps...')
+        # Step 3: Remove top 10% pixels and retrain to assess accuracy change.
+        # Each sign mode gets its own output directory so the positive and negative
+        # ROAR runs can live side by side without overwriting each other.
+        roar_dir = f'{model_path}/retrained' if roar_sign == 'abs' else f'{model_path}/retrained_{roar_sign}'
+        sign_description = {
+            'abs': 'highest-magnitude',
+            'positive': 'highest positively attributed',
+            'negative': 'highest negatively attributed',
+        }[roar_sign]
+        print(f'Removing top 10% {sign_description} pixels based on saliency maps...')
 
         exclusion_masks = np.zeros_like(images, dtype='uint8')
         exclusion_masks[indices_train] = build_high_saliency_exclusion_masks(
-            images[indices_train], train_saliency_maps, percentile=90)
+            images[indices_train], train_saliency_maps, percentile=90, sign=roar_sign)
         exclusion_masks[indices_dev] = build_high_saliency_exclusion_masks(
-            images[indices_dev], dev_saliency_maps, percentile=90)
+            images[indices_dev], dev_saliency_maps, percentile=90, sign=roar_sign)
         test_exclusion_masks = build_high_saliency_exclusion_masks(
-            test_images, test_saliency_maps, percentile=90)
+            test_images, test_saliency_maps, percentile=90, sign=roar_sign)
         images_modified = images.copy()
         images_modified[exclusion_masks == 1] = 0
         test_images_modified = test_images.copy()
@@ -175,33 +203,33 @@ def run_experiment(
         test_images_modified_to_save = prepare_images_for_serialization(test_images_modified)
 
         # Save modified images to disk for inspection and reproducibility
-        os.makedirs(f'{model_path}/retrained/modified_train_dev_images', exist_ok=True)
-        os.makedirs(f'{model_path}/retrained/modified_test_images', exist_ok=True)
-        np.save(f'{model_path}/retrained/train_dev_exclusion_masks.npy', exclusion_masks)
-        np.save(f'{model_path}/retrained/test_exclusion_masks.npy', test_exclusion_masks)
-        np.save(f'{model_path}/retrained/modified_train_dev_images.npy', images_modified_to_save)
-        np.save(f'{model_path}/retrained/modified_test_images.npy', test_images_modified_to_save)
+        os.makedirs(f'{roar_dir}/modified_train_dev_images', exist_ok=True)
+        os.makedirs(f'{roar_dir}/modified_test_images', exist_ok=True)
+        np.save(f'{roar_dir}/train_dev_exclusion_masks.npy', exclusion_masks)
+        np.save(f'{roar_dir}/test_exclusion_masks.npy', test_exclusion_masks)
+        np.save(f'{roar_dir}/modified_train_dev_images.npy', images_modified_to_save)
+        np.save(f'{roar_dir}/modified_test_images.npy', test_images_modified_to_save)
         # Also save individual PNG visualizations
         for ii in range(images_modified_to_save.shape[0]):
             img = images_modified_to_save[ii]
             img_rgba = gray2rgba(img)
-            skio.imsave(f'{model_path}/retrained/modified_train_dev_images/{ii}_modified.png', img_rgba)
+            skio.imsave(f'{roar_dir}/modified_train_dev_images/{ii}_modified.png', img_rgba)
         for ii in range(test_images_modified_to_save.shape[0]):
             img = test_images_modified_to_save[ii]
             img_rgba = gray2rgba(img)
-            skio.imsave(f'{model_path}/retrained/modified_test_images/{ii}_modified.png', img_rgba)
+            skio.imsave(f'{roar_dir}/modified_test_images/{ii}_modified.png', img_rgba)
 
         print('Retraining model with modified images to assess accuracy change...')
-        os.makedirs(f'{model_path}/retrained', exist_ok=True)
+        os.makedirs(roar_dir, exist_ok=True)
         model_retrained, model_trainer_retrained, _, _, _, _ = train_and_evaluate_model(
             images, labels, indices_train, indices_dev, test_images, test_labels,
-            extraction_parameters, device, f'{model_path}/retrained', feature_count,
-            unique_labels, kwargs['skip_training'], kwargs['model_type_name'],
+            extraction_parameters, device, roar_dir, feature_count,
+            unique_labels, False if roar_only else kwargs['skip_training'], kwargs['model_type_name'],
             masks=exclusion_masks, test_masks=test_exclusion_masks
         )
 
         # Save retrained model metrics for comparison
-        print('Retrained model evaluation completed. Metrics saved to retrained/ directory.')
+        print(f'Retrained model evaluation completed. Metrics saved to {roar_dir}.')
 
     if not run_metrics:
         print('Skipping activation map, visualization, and metrics steps.')

@@ -51,6 +51,18 @@ if __name__ == '__main__':
                              'from a previous run (required if ROAR or metrics steps are enabled).')
     parser.add_argument('--skip-roar', action='store_true',
                         help='Skip the ROAR (remove-top-saliency-pixels-and-retrain) step.')
+    parser.add_argument('--roar-sign', type=str, default='abs',
+                        choices=['abs', 'positive', 'negative'],
+                        help='Which attributions the ROAR step removes: abs (highest magnitude, '
+                             'default), positive (highest positively attributed pixels) or '
+                             'negative (highest negatively attributed pixels). The positive and '
+                             'negative runs write to retrained_positive/ and retrained_negative/.')
+    parser.add_argument('--roar-only', action='store_true',
+                        help='Re-run only the ROAR step on top of an existing run: the base '
+                             'model is loaded from its cached weights and the saliency maps '
+                             'from their cache, and the activation-map/visualization/faithfulness '
+                             'metrics are skipped. Implies --skip-saliency-generation and '
+                             '--skip-metrics. Useful for evaluating another --roar-sign.')
     parser.add_argument('--skip-metrics', action='store_true',
                         help='Skip activation map generation, visualization, and faithfulness '
                              'metric computation.')
@@ -93,4 +105,6 @@ if __name__ == '__main__':
                        profile_saliency=args.profile_saliency,
                        run_saliency=not args.skip_saliency_generation,
                        run_roar=not args.skip_roar,
+                       roar_sign=args.roar_sign,
+                       roar_only=args.roar_only,
                        run_metrics=not args.skip_metrics)

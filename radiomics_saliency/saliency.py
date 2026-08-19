@@ -418,7 +418,49 @@ class SaliencyMapGenerator:
         return metrics
 
 
-def remove_high_saliency_pixels(images, saliency_maps, percentile=90):
+def _saliency_selection_mask(saliency_map, percentile=90, sign='abs'):
+    """
+    Build a boolean mask selecting the most-attributed pixels of a single saliency map.
+
+    Pixels with exactly zero attribution (typically background outside the region of
+    interest) never carry attribution, so they are excluded from the ranking; the
+    percentile is taken over the non-zero attributions only.
+
+    Args:
+        saliency_map: Signed attribution map for one image
+        percentile: Percentile threshold, e.g. 90 selects the top 10% (default: 90)
+        sign: Which attributions to rank.
+            'abs'      - largest magnitude regardless of direction (original behaviour)
+            'positive' - largest positive attributions (evidence for the prediction)
+            'negative' - largest negative attributions (evidence against the prediction)
+
+    Returns:
+        Boolean mask with True at the selected pixels
+    """
+    saliency_map = np.asarray(saliency_map)
+    valid = saliency_map != 0
+    if not np.any(valid):
+        return np.zeros(saliency_map.shape, dtype=bool)
+
+    if sign == 'abs':
+        threshold = np.percentile(np.abs(saliency_map[valid]), percentile)
+        return valid & (np.abs(saliency_map) >= threshold)
+
+    if sign == 'positive':
+        # Rank over every non-zero attribution so the positive and negative runs remove
+        # the same number of pixels; clamp to strictly positive pixels in case fewer than
+        # (100 - percentile)% of the attributions are positive.
+        threshold = np.percentile(saliency_map[valid], percentile)
+        return valid & (saliency_map > 0) & (saliency_map >= threshold)
+
+    if sign == 'negative':
+        threshold = np.percentile(saliency_map[valid], 100 - percentile)
+        return valid & (saliency_map < 0) & (saliency_map <= threshold)
+
+    raise ValueError(f"Unknown saliency sign '{sign}'; expected 'abs', 'positive' or 'negative'.")
+
+
+def remove_high_saliency_pixels(images, saliency_maps, percentile=90, sign='abs'):
     """
     Remove pixels with highest saliency values from images.
 
@@ -426,6 +468,7 @@ def remove_high_saliency_pixels(images, saliency_maps, percentile=90):
         images: Original images array
         saliency_maps: Saliency maps aligned with the given images array
         percentile: Percentile threshold for pixel removal (default: 90 for top 10%)
+        sign: 'abs', 'positive' or 'negative'; see _saliency_selection_mask
 
     Returns:
         Modified images array with high-saliency pixels set to 0
@@ -433,21 +476,15 @@ def remove_high_saliency_pixels(images, saliency_maps, percentile=90):
     images_modified = images.copy()
 
     for idx, saliency_map in enumerate(saliency_maps):
-        saliency_abs = np.abs(saliency_map)
-        if np.any(saliency_abs > 0):
-            threshold = np.percentile(saliency_abs[saliency_abs > 0], percentile)
-            images_modified[idx][saliency_abs >= threshold] = 0
+        images_modified[idx][_saliency_selection_mask(saliency_map, percentile, sign)] = 0
 
     return images_modified
 
 
-def build_high_saliency_exclusion_masks(images, saliency_maps, percentile=90):
+def build_high_saliency_exclusion_masks(images, saliency_maps, percentile=90, sign='abs'):
     exclusion_masks = np.zeros_like(images, dtype='uint8')
     for idx, saliency_map in enumerate(saliency_maps):
-        saliency_abs = np.abs(saliency_map)
-        if np.any(saliency_abs > 0):
-            threshold = np.percentile(saliency_abs[saliency_abs > 0], percentile)
-            exclusion_masks[idx][saliency_abs >= threshold] = 1
+        exclusion_masks[idx][_saliency_selection_mask(saliency_map, percentile, sign)] = 1
     return exclusion_masks
 
 
